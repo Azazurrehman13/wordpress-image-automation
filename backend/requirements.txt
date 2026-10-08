@@ -1,0 +1,15 @@
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2.6
+sqlalchemy>=2.0
+playwright>=1.44
+anthropic>=0.40
+pillow>=10.3
+opencv-python-headless>=4.9
+numpy>=1.26
+httpx>=0.27
+python-dotenv>=1.0
+beautifulsoup4>=4.12
+# tests
+pytest>=8.0
+pytest-asyncio>=0.23
