@@ -299,32 +299,99 @@ class WordPressAutomation:
     # --------------------------------------------------------------- search
     @staticmethod
     def _norm_wc(p: dict) -> dict:
-        return {"id": p["id"], "name": p.get("name", ""), "permalink": p.get("permalink", ""), "status": p.get("status", "")}
+        return {"id": p["id"], "name": p.get("name", ""), "permalink": p.get("permalink", ""), "status": p.get("status", ""),
+                "categories": [c.get("name", "") for c in (p.get("categories") or []) if isinstance(c, dict)]}
 
     @staticmethod
     def _norm_wp(p: dict) -> dict:
         t = p.get("title", {})
         return {"id": p["id"], "name": t.get("raw") or t.get("rendered", ""), "permalink": p.get("link", ""), "status": p.get("status", "")}
 
-    async def search_product(self, product_name: str) -> list[dict]:
-        """Products matching the name, limited to cfg.search_statuses (default: draft only - published products are not listed).
-        Copies ("... (Copy)") are never listed."""
+    async def _paged(self, route: str, params: dict, limit: int = 3000) -> list[dict] | None:
+        """Every page of a REST list (100 per page, no 20-item cut-off). None = the first page failed, so the caller can try another route."""
+        items: list[dict] = []
+        page = 1
+        while True:
+            r = await self.rest("GET", route, params={**params, "per_page": 100, "page": page})
+            if not r.ok or not isinstance(r.data, list):
+                return items if page > 1 else None  # a failure after page 1 (e.g. page out of range) just ends the list
+            items.extend(r.data)
+            try:
+                total_pages = int(r.headers.get("x-wp-totalpages", "0") or 0)
+            except ValueError:
+                total_pages = 0
+            if len(r.data) < 100 or (total_pages and page >= total_pages) or len(items) >= limit:
+                return items
+            page += 1
+
+    @staticmethod
+    def _stem(word: str) -> str:
+        """'bags' -> 'bag', 'watches' -> 'watch': plural-tolerant word matching."""
+        w = word.lower()
+        for suf in ("es", "s"):
+            if len(w) > len(suf) + 2 and w.endswith(suf):
+                return w[: -len(suf)]
+        return w
+
+    @classmethod
+    def _words_match(cls, tokens: list[str], item: dict) -> bool:
+        """Every searched word must appear in the product's NAME or CATEGORY names (not just somewhere in its description)."""
+        hay = f"{item.get('name', '')} {' '.join(item.get('categories') or [])}".lower()
+        return all(t in hay for t in tokens)
+
+    async def search_product(self, product_name: str = "") -> list[dict]:
+        """Draft products (cfg.search_statuses), every page read - no 20-item limit.
+        Empty name: ALL drafts, A-Z. With a name: drafts whose NAME or CATEGORY contains the words (plural-tolerant: "bags" finds
+        "Handbag"), plus every draft inside a category matching the words. A product that merely mentions the word in its
+        description is NOT listed. Copies are listed too; the UI marks them and they are never processed."""
+        q = (product_name or "").strip()
+        tokens = [self._stem(w) for w in re.findall(r"\w+", q.lower())]
         wanted = list(cfg.search_statuses)
         found: dict[int, dict] = {}
         rest_ok = False
+
+        cat_ids: list[int] = []
+        if q:
+            cats = await self._paged("wc/v3/products/categories", {"search": q})
+            cat_ids = [c["id"] for c in (cats or []) if isinstance(c, dict) and "id" in c]
+            if not cat_ids and tokens:  # "Bags" should also reach a category called "Handbags"/"Bag": try the stemmed word
+                cats = await self._paged("wc/v3/products/categories", {"search": tokens[0]})
+                cat_ids = [c["id"] for c in (cats or []) if isinstance(c, dict) and "id" in c and self._words_match(tokens, {"name": c.get("name", "")})]
+
         for st in wanted:  # WooCommerce accepts one status per request
-            r = await self.rest("GET", "wc/v3/products", params={"search": product_name, "per_page": 20, "status": st})
-            if r.ok and isinstance(r.data, list):
+            base = {"status": st, "orderby": "title", "order": "asc"}
+            if not q:
+                data = await self._paged("wc/v3/products", base)
+                if data is not None:
+                    rest_ok = True
+                    found.update({p["id"]: self._norm_wc(p) for p in data})
+                continue
+            data = await self._paged("wc/v3/products", {**base, "search": q})
+            if data is not None:
                 rest_ok = True
-                found.update({p["id"]: self._norm_wc(p) for p in r.data})
-        if not rest_ok:
-            r = await self.rest("GET", "wp/v2/product", params={"search": product_name, "per_page": 20, "status": ",".join(wanted), "context": "edit"})
-            if r.ok and isinstance(r.data, list):
+                for p in data:
+                    n = self._norm_wc(p)
+                    if self._words_match(tokens, n):
+                        found[n["id"]] = n
+            if cat_ids:
+                data = await self._paged("wc/v3/products", {**base, "category": ",".join(str(i) for i in cat_ids)})
+                if data is not None:
+                    rest_ok = True
+                    found.update({p["id"]: self._norm_wc(p) for p in data})
+
+        if not rest_ok:  # WooCommerce routes unavailable: use the plain WordPress product route
+            base = {"status": ",".join(wanted), "context": "edit"}
+            data = await self._paged("wp/v2/product", {**base, "search": q} if q else base)
+            if data is not None:
                 rest_ok = True
-                found.update({p["id"]: self._norm_wp(p) for p in r.data})
-        if not rest_ok:
-            found = {i: m for i, m in enumerate(await self._browser_search(product_name))}
-        return [m for m in found.values() if m["status"] in wanted and not is_copy_product(m["name"])][:20]  # the site's public search only sees published items -> dropped here
+                for p in data:
+                    n = self._norm_wp(p)
+                    if not q or self._words_match(tokens, n):
+                        found[n["id"]] = n
+
+        if not rest_ok and q:
+            found = {i: m for i, m in enumerate(await self._browser_search(q)) if self._words_match(tokens, m)}
+        return [m for m in found.values() if m["status"] in wanted]  # the site's public search only sees published items -> dropped here
 
     async def _browser_search(self, product_name: str) -> list[dict]:
         page = await self.pw.context.new_page()
@@ -342,7 +409,7 @@ class WordPressAutomation:
                 continue
             seen.add(l["href"])
             out.append({"id": None, "name": l["text"].split("\n")[0], "permalink": l["href"], "status": "publish"})
-        return out[:20]
+        return out[:200]
 
     # ------------------------------------------------------- product reading
     async def open_product(self, product_url: str) -> dict:

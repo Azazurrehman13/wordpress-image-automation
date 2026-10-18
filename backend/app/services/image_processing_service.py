@@ -21,6 +21,11 @@ OUTPUT_FORMATS = {
     "gif": ("GIF", ".gif"), "bmp": ("BMP", ".bmp"), "tiff": ("TIFF", ".tiff"), "tif": ("TIFF", ".tif"),
 }
 
+# Below this many pixels on the short side a product photo starts to look soft on a product page.
+SOFT_BELOW = 700
+# An OUTPUT_SIZE under this is a thumbnail setting (old default 240): ignored, because it makes product photos blurry.
+MIN_FIXED_OUTPUT = 600
+
 
 @dataclass
 class ValidationResult:
@@ -237,25 +242,37 @@ class ImageProcessor:
         border = np.concatenate([a[0, :], a[-1, :], a[:, 0], a[:, -1]])
         return tuple(int(v) for v in np.median(border, axis=0))
 
+    @staticmethod
+    def _target_side(img: Image.Image) -> int:
+        """Side of the final square image.
+        Default: the image's own resolution (never shrunk to a thumbnail, never enlarged), capped at MAX_OUTPUT_SIDE.
+        An explicit OUTPUT_SIZE of 600 or more forces that exact size; smaller values are ignored (they blur product photos)."""
+        if cfg.output_size and cfg.output_size >= MIN_FIXED_OUTPUT:
+            return cfg.output_size
+        return max(8, min(max(img.size), cfg.max_output_side))
+
     def optimize_image(self, img: Image.Image, dest: Path, fmt: str | None = None) -> Path:
-        """Resize to exactly cfg.output_size x cfg.output_size (no distortion) and save in the chosen format.
-        fmt: one of OUTPUT_FORMATS, or "original"; defaults to cfg.output_format."""
+        """Save a square image at full quality (no distortion): the whole product stays visible and the resolution of the source
+        is kept, so the picture stays sharp on the product page. fmt: one of OUTPUT_FORMATS, or "original"; defaults to cfg.output_format."""
         img = img.convert("RGB")
-        size = cfg.output_size
+        size = self._target_side(img)
         if img.size != (size, size):
+            shrinking = max(img.size) > size
             # contain + pad keeps the whole product visible; crop_image() already squares most images
             img = ImageOps.pad(img, (size, size), method=Image.LANCZOS, color=self._edge_color(img))
-            img = img.filter(ImageFilter.UnsharpMask(radius=0.6, percent=40, threshold=2))  # restore detail lost by downscaling
+            if shrinking:  # only after a real downscale: restore the detail the resize softened
+                img = img.filter(ImageFilter.UnsharpMask(radius=0.8, percent=45, threshold=2))
         key = (fmt or cfg.output_format or "jpg").lower().lstrip(".")
         if key not in OUTPUT_FORMATS:
             key = "jpg"
         pil_fmt, ext = OUTPUT_FORMATS[key]
         dest = dest.with_suffix(ext)
-        q = cfg.jpeg_quality
+        q = max(cfg.jpeg_quality, 90)  # high quality; only lowered if the file would exceed MAX_UPLOAD_BYTES
         while True:
             buf = io.BytesIO()
             if pil_fmt == "JPEG":
-                img.save(buf, "JPEG", quality=q, optimize=True, progressive=True)
+                # subsampling=0 keeps full colour detail (default 4:2:0 smears fine edges and text)
+                img.save(buf, "JPEG", quality=q, optimize=True, progressive=True, subsampling=0)
             elif pil_fmt == "WEBP":
                 img.save(buf, "WEBP", quality=q, method=6)
             elif pil_fmt == "PNG":
@@ -266,9 +283,9 @@ class ImageProcessor:
                 img.save(buf, "TIFF", compression="tiff_lzw")
             else:  # BMP
                 img.save(buf, pil_fmt)
-            if pil_fmt not in ("JPEG", "WEBP") or buf.tell() <= cfg.max_upload_bytes or q <= 60:
+            if pil_fmt not in ("JPEG", "WEBP") or buf.tell() <= cfg.max_upload_bytes or q <= 70:
                 break
-            q -= 6
+            q -= 4
         dest.write_bytes(buf.getvalue())
         return dest
 
@@ -294,8 +311,12 @@ class ImageProcessor:
             gray = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
         sharp = float(cv2.Laplacian(gray, cv2.CV_64F).var())
         rep = QualityReport(w, h, size, round(sharp, 1))
-        if (w, h) != (cfg.output_size, cfg.output_size):
-            rep.issues.append(f"Wrong output size ({w}x{h}), expected {cfg.output_size}x{cfg.output_size}")
+        if w != h:
+            rep.issues.append(f"Output is not square ({w}x{h})")
+        if min(w, h) < cfg.min_final_side:
+            rep.issues.append(f"Output too small ({w}x{h}), at least {cfg.min_final_side}px required")
+        elif min(w, h) < SOFT_BELOW:
+            rep.warnings.append(f"Source image is small ({w}x{h}px); it may look slightly soft on the product page")
         if size > cfg.max_upload_bytes * 1.5:
             rep.issues.append("File size too large")
         if sharp < 20:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import html as _html
 import io
 import json
 import re
@@ -48,6 +49,15 @@ class ProductGrouping(BaseModel):
 
 class OddImages(BaseModel):
     different_product_ids: list[int] = []
+
+
+class AltItem(BaseModel):
+    image_id: int
+    alt_text: str = ""
+
+
+class AltBatch(BaseModel):
+    alts: list[AltItem] = []
 
 
 @dataclass
@@ -281,18 +291,37 @@ class ClaudeService:
         view_types: dict[int, str],
         taken: list[str] | None = None,
     ) -> dict[int, str]:
-        """Return the original draft product title exactly as supplied for every image."""
-        if not product_title:
-            raise AppError(
-                "invalid_product_title",
-                "Product title is empty. Cannot generate alt text.",
-                400,
-            )
-
-        # Intentionally do not call Claude here. This guarantees the original
-        # draft title can never be rewritten, reordered, shortened, expanded,
-        # or supplemented with AI-generated words.
-        return {image.id: product_title for image in images}
+        """One alt text per image: a natural variation of the product title. Every title word stays, in the same order, and
+        1-4 words describing what is visible are added before, after or inside it. Wording differs for every image.
+        The caller validates the result (image_metadata.validate_alt) and falls back to a safe text when a reply is not usable."""
+        title = _html.unescape(product_title or "").strip()
+        if not title:
+            raise AppError("invalid_product_title", "Product title is empty. Cannot generate alt text.", 400)
+        if not images:
+            return {}
+        hints = {i.id: (view_types.get(i.id) or "other").replace("_", " ") for i in images}
+        instruction = (
+            f'Product title: "{title}".\n'
+            "Write ONE alt text for each image above. RULES:\n"
+            "1. Keep EVERY word of the title, in the same order, spelled exactly as given. Never remove, reword or reorder title words.\n"
+            "2. Add 1 to 4 extra words that describe what is visible (colour, material, finish, style: for example Black, Leather, "
+            "Luxury, Soft, Grained, Compact). The extra words may go before the title, after it, or between its words, and a "
+            "connector such as \"In\" is allowed (for example \"... In Black\").\n"
+            "3. If the title already contains the colour, do not repeat it: use material, finish or style words instead.\n"
+            "4. Every alt text must read naturally, like a product name. Describe only what is visible; never invent a colour or "
+            "material that is not shown.\n"
+            "5. Every image gets a DIFFERENT wording: vary which extra words are used and where they are placed.\n"
+            "6. No view labels (front view, side view...), no URLs, no website or shop names, at most 125 characters.\n"
+            f"Style examples for the title \"The Row Iowa Duffle Bag\": \"The Row Iowa Duffle Bag Black\", "
+            "\"The Row Iowa Black Leather Duffle Bag\", \"The Row Iowa Duffle Bag In Black\", \"Black The Row Iowa Duffle Bag\", "
+            "\"The Row Iowa Black Luxury Duffle Bag\". (Examples of the pattern only: use the real title and what is really visible.)\n"
+            f"What each image shows (for your information only): {json.dumps(hints)}\n"
+            + (f"Alt texts already used for this product (do not repeat them): {json.dumps(taken)}\n" if taken else "")
+            + 'Return JSON: {"alts":[{"image_id":<id>,"alt_text":"..."}]} with exactly one entry per image id given.'
+        )
+        res = await self._ask(AltBatch, await self._blocks(images, 640), instruction, 900)
+        wanted = {i.id for i in images}
+        return {a.image_id: a.alt_text.strip() for a in res.alts if a.image_id in wanted and a.alt_text.strip()}
 
     @staticmethod
     def sanitize_metadata(md: ImageMetadata, product_name: str, image_type: str, banned: list[str] | None = None) -> ImageMetadata:

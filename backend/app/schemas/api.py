@@ -14,7 +14,8 @@ class ConnectRequest(BaseModel):
 
 
 class SearchRequest(BaseModel):
-    query: str = Field(min_length=2, max_length=300)
+    """Optional filter. Empty = list every draft product; text = drafts matching the name OR a category (e.g. "bags")."""
+    query: str = Field(default="", max_length=300)
 
 
 class InspectRequest(BaseModel):
@@ -39,7 +40,7 @@ class BatchProduct(BaseModel):
 
 
 class BatchRequest(BaseModel):
-    products: list[BatchProduct] = Field(min_length=1, max_length=50)
+    products: list[BatchProduct] = Field(min_length=1, max_length=1000)
 
 
 class SelectionUpdate(BaseModel):

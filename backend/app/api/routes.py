@@ -80,16 +80,35 @@ def _require_wp() -> None:
         raise AppError("wordpress_not_connected", "Connect to WordPress first.", 409)
 
 
+def _category_counts(matches: list[dict]) -> list[dict]:
+    """Categories that actually contain draft products, with how many - shown as quick filters in the UI."""
+    counts: dict[str, int] = {}
+    for m in matches:
+        for c in m.get("categories") or []:
+            if c:
+                counts[c] = counts.get(c, 0) + 1
+    return [{"name": n, "count": k} for n, k in sorted(counts.items(), key=lambda kv: kv[0].lower())]
+
+
 @router.post("/products/search")
 async def search_products(body: SearchRequest):
+    """Optional search. No text: every draft product (A-Z). With text: drafts whose name or category contains the words
+    (or that sit inside a matching category), best name match first. An empty result is not an error: it comes back with
+    the categories that do contain drafts, so the user can pick one."""
     _require_wp()
-    matches = await svc.search.search(body.query.strip())
-    if not matches:
-        raise AppError("product_not_found", f"No product matching '{body.query}' was found on the connected site.", 404)
+    query = body.query.strip()
+    categories = None
+    if query:
+        matches = await svc.search.search(query)
+        if not matches:
+            categories = _category_counts(await svc.wp.search_product(""))
+    else:
+        matches = sorted(({**m, "score": 0.0} for m in await svc.wp.search_product("")), key=lambda m: (m["name"] or "").lower())
+        categories = _category_counts(matches)
     threshold = float(settings_store.get("match_threshold"))
-    auto = svc.search.auto_select(matches, threshold)
-    return {"matches": matches, "auto_selected_id": auto["id"] if auto else None,
-            "auto_selected_url": auto["permalink"] if auto else None, "threshold": threshold}
+    # The full list is always shown, so nothing is auto-selected: the user picks one, or runs "Use all One by One".
+    return {"matches": matches, "auto_selected_id": None, "auto_selected_url": None, "threshold": threshold,
+            "query": query, "categories": categories}
 
 
 @router.post("/products/inspect")

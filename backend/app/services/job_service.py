@@ -466,17 +466,26 @@ class JobService:
 
         p.start("metadata_generated")
         from app.services.description_parser_service import host_of
-        from app.services.image_metadata import build_metadata
+        from app.services.image_metadata import build_metadata, finalize_alts, keep_existing_alts
 
-        # ALT TEXT RULE: the alt text of every image is the original product title, character for character.
-        # No view labels, no variations, no extra words (HTML entities such as &amp; are turned back into the real character).
-        original_title = _html.unescape(job.product_name or "").strip()
+        # ALT TEXT RULE: a natural variation of the product title. Every title word stays, in the same order, with 1-4 words that
+        # describe what is visible added before, after or inside it (e.g. "The Row Iowa Duffle Bag In Black"); different for every image.
         used_labels: dict[str, int] = {}
         banned = [host_of(job.original_source_url or "")]
         types = {r.id: (r.analysis or {}).get("image_type", "other") for r in recs}
         mds = [build_metadata(job.product_name, types[r.id], pos == 0, used_labels, banned) for pos, r in enumerate(recs)]  # recs[0] = main
+        kept = keep_existing_alts(job.product_name, [{"id": r.id, "alt": r.alt_text, "default": md["title"]} for r, md in zip(recs, mds)], banned)
+        need = [r for r in recs if r.id not in kept]
+        generated: dict[int, str] = {}
+        if need:
+            try:
+                generated = await s.claude.generate_alt_texts(
+                    [ImageInput(r.id, Path(r.processed_path)) for r in need], job.product_name, types, sorted(kept.values()))
+            except AppError as e:
+                warnings.append(f"Alt text variations could not be generated ({e.message}); title-based alt texts were used instead.")
+        alts = finalize_alts(job.product_name, [{"id": r.id, "type": types[r.id]} for r in recs], kept, generated, banned)
         for r, md in zip(recs, mds):
-            md["alt_text"] = original_title
+            md["alt_text"] = alts[r.id]
             if (r.title, r.alt_text, r.caption, r.description) != (md["title"], md["alt_text"], md["caption"], md["description"]):
                 self._img_set(r.id, **md)
                 r.title, r.alt_text, r.caption, r.description = md["title"], md["alt_text"], md["caption"], md["description"]

@@ -114,7 +114,7 @@ def load_config() -> Config:
         max_candidates=_int("MAX_CANDIDATES", 30),
         max_analyze=_int("MAX_ANALYZE", 24),
         max_output_side=_int("MAX_OUTPUT_SIDE", 2000),
-        output_size=_int("OUTPUT_SIZE", 240),
+        output_size=_int("OUTPUT_SIZE", 0),
         jpeg_quality=_int("JPEG_QUALITY", 88),
         output_format=_str("OUTPUT_FORMAT", "jpg").lower(),
         search_statuses=tuple(x.strip().lower() for x in _str("SEARCH_STATUSES", "draft").split(",") if x.strip()) or ("draft",),
