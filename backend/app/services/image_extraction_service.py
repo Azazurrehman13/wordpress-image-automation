@@ -70,6 +70,38 @@ def _og_image(html: str, base: str) -> str | None:
     return None
 
 
+def thumb_gallery(cands: list["ImageCandidate"], htmls: list[str], base: str) -> list["ImageCandidate"]:
+    """The product's gallery read from the page's own thumbnail strip (<a href="#Media123"><img ...></a>, used by Shopify
+    themes). The strip lists exactly the product's photos, in order, whatever the files are called (1358W4329BEAF,
+    78_029copy ...). Every candidate whose file name matches a thumbnail is a gallery photo, at full size. Images of
+    'style with' / 'similar items' are not in the strip, so they never get in. Returns [] when the page has no such strip."""
+    order: list[str] = []
+    for html in htmls:
+        soup = BeautifulSoup(_cut_related(html), "html.parser")
+        for a in soup.select('a[href^="#Media"], a[href^="#media"]'):
+            for img in a.find_all("img"):
+                for attr in ("src", "data-src", "data-original", "srcset", "data-srcset"):
+                    raw = (img.get(attr) or "").strip()
+                    if raw:
+                        url = urljoin(base, raw.split()[0].split(",")[0])
+                        st = _stem(url)
+                        if st and st not in order and not _SWATCH.search(url):
+                            order.append(st)
+                        break
+        if order:
+            break
+    if not order:
+        return []
+    by_stem: dict[str, ImageCandidate] = {}
+    for c in cands:
+        st = _stem(c.url)
+        if st in order:
+            cur = by_stem.get(st)
+            if cur is None or (cur.url.startswith("http://") and c.url.startswith("https://")):  # prefer the https copy
+                by_stem[st] = c
+    return [by_stem[s] for s in order if s in by_stem]
+
+
 def sibling_gallery(cands: list["ImageCandidate"], htmls: list[str], base: str) -> list["ImageCandidate"]:
     """The product's own gallery, found WITHOUT guessing: the page's main image (og:image) names the product
     (e.g. W1740L694BLKF); its other photos carry the same name with another view letter (…BLKR, …BLKD). Images of
@@ -343,7 +375,12 @@ class ImageExtractor:
         merged = merge_candidates(rendered, static)
         if not merged:
             raise AppError("source_unavailable", browser_error or static_err or "No images were found on the page.", 502)
-        gallery = sibling_gallery(merged, [h for h in (rendered_html, static_html) if h], final_url)
+        htmls = [h for h in (rendered_html, static_html) if h]
+        strip = thumb_gallery(merged, htmls, final_url)
+        if strip:  # the page's own thumbnail strip: exactly the product's photos (1 to N), in the shop's order
+            return ExtractionResult(final_url, strip[:10], used_browser, browser_error,
+                                    method=f"product gallery (thumbnail strip, {len(strip)} images)", exact=True)
+        gallery = sibling_gallery(merged, htmls, final_url)
         if len(gallery) >= 2:  # the product's own photos, identified by the main image's name: nothing from other products
             return ExtractionResult(final_url, gallery[:10], used_browser, browser_error,
                                     method="product gallery (same-name images)", exact=True)
